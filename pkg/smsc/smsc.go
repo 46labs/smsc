@@ -4,6 +4,7 @@ package smsc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -52,6 +53,7 @@ type Server struct {
 	errors   []data.CommandStatusType
 	receipts Receipts
 	nextID   uint64
+	nextRef  byte
 	ctx      context.Context
 }
 
@@ -82,7 +84,9 @@ func (s *Server) Serve(ln net.Listener) error {
 type session struct {
 	conn     net.Conn
 	systemID string
-	mu       sync.Mutex // writes
+	receives bool // a receiver or transceiver bind
+	done     chan struct{}
+	mu       sync.Mutex // writes and acks
 	acks     map[int32]chan data.CommandStatusType
 }
 
@@ -99,8 +103,9 @@ func (ss *session) write(p pdu.PDU) error {
 }
 
 func (s *Server) handle(c net.Conn) {
-	ss := &session{conn: c, acks: map[int32]chan data.CommandStatusType{}}
+	ss := &session{conn: c, done: make(chan struct{}), acks: map[int32]chan data.CommandStatusType{}}
 	defer func() {
+		close(ss.done)
 		s.mu.Lock()
 		delete(s.sessions, ss)
 		s.mu.Unlock()
@@ -163,17 +168,34 @@ func (s *Server) bind(ss *session, b *pdu.BindRequest) bool {
 	case pw != b.Password:
 		resp.CommandStatus = data.ESME_RINVPASWD
 	}
-	resp.SystemID = "smsc-mock"
+	s.record(&session{systemID: b.SystemID}, b)
 	if resp.CommandStatus != data.ESME_ROK {
-		s.reply(ss, resp)
+		// An error response is its header alone.
+		if err := ss.writeHeader(resp.CommandID, resp.CommandStatus, b.SequenceNumber); err != nil {
+			slog.Debug("bind refuse", "system_id", b.SystemID, "error", err)
+		}
 		return false
 	}
+	resp.SystemID = "smsc-mock"
 	ss.systemID = b.SystemID
+	ss.receives = b.BindingType != pdu.Transmitter
 	s.mu.Lock()
 	s.sessions[ss] = struct{}{}
 	s.mu.Unlock()
-	s.record(ss, b)
 	return s.reply(ss, resp)
+}
+
+// writeHeader writes a PDU that is only a header.
+func (ss *session) writeHeader(id data.CommandIDType, status data.CommandStatusType, seq int32) error {
+	var h [16]byte
+	binary.BigEndian.PutUint32(h[0:], 16)
+	binary.BigEndian.PutUint32(h[4:], uint32(id))
+	binary.BigEndian.PutUint32(h[8:], uint32(status))
+	binary.BigEndian.PutUint32(h[12:], uint32(seq))
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	_, err := ss.conn.Write(h[:])
+	return err
 }
 
 func (s *Server) submit(ss *session, v *pdu.SubmitSM) {
@@ -197,18 +219,26 @@ func (s *Server) submit(ss *session, v *pdu.SubmitSM) {
 	if v.RegisteredDelivery&0x03 == 2 && receipts.State == "DELIVRD" {
 		return // failure receipts only
 	}
-	text, err := v.Message.GetMessage()
-	if err != nil {
-		text = ""
-	}
+	text := messageText(&v.Message)
 	go func() {
 		select {
 		case <-time.After(receipts.Delay):
 		case <-s.ctx.Done():
 			return
 		}
-		r := receipt(v, resp.MessageID, receipts.State, text, time.Now())
-		if err := ss.write(r); err != nil {
+		to := ss
+		if !ss.receives {
+			to = s.receiver(ss.systemID)
+		}
+		if to == nil {
+			slog.Debug("receipt: no receiving bind", "system_id", ss.systemID, "message_id", resp.MessageID)
+			return
+		}
+		r, err := receipt(v, resp.MessageID, receipts.State, text, time.Now())
+		if err == nil {
+			err = to.write(r)
+		}
+		if err != nil {
 			slog.Debug("receipt", "message_id", resp.MessageID, "error", err)
 		}
 	}()
@@ -222,7 +252,7 @@ var messageStates = map[string]byte{
 
 // receipt builds an SMSC delivery receipt for a submit: Appendix B text and
 // the receipted_message_id and message_state TLVs.
-func receipt(v *pdu.SubmitSM, id, state, text string, now time.Time) *pdu.DeliverSM {
+func receipt(v *pdu.SubmitSM, id, state, text string, now time.Time) (*pdu.DeliverSM, error) {
 	d := pdu.NewDeliverSM().(*pdu.DeliverSM)
 	d.SourceAddr = v.DestAddr
 	d.DestAddr = v.SourceAddr
@@ -231,17 +261,38 @@ func receipt(v *pdu.SubmitSM, id, state, text string, now time.Time) *pdu.Delive
 	if state == "DELIVRD" {
 		dlvrd = "001"
 	}
-	if r := []rune(text); len(r) > 20 {
-		text = string(r[:20])
+	excerpt := []rune{}
+	for _, c := range text {
+		if len(excerpt) == 20 {
+			break
+		}
+		if !strings.ContainsRune(gsm7Chars, c) {
+			c = '?'
+		}
+		excerpt = append(excerpt, c)
 	}
+	text = string(excerpt)
 	stamp := now.UTC().Format("0601021504")
 	body := fmt.Sprintf("id:%s sub:001 dlvrd:%s submit date:%s done date:%s stat:%s err:000 text:%s", id, dlvrd, stamp, stamp, state, text)
 	if err := d.Message.SetMessageWithEncoding(body, data.GSM7BIT); err != nil {
-		slog.Debug("receipt text", "error", err)
+		return nil, fmt.Errorf("receipt text: %w", err)
 	}
 	d.RegisterOptionalParam(pdu.Field{Tag: pdu.TagReceiptedMessageID, Data: append([]byte(id), 0)})
 	d.RegisterOptionalParam(pdu.Field{Tag: pdu.TagMessageStateOption, Data: []byte{messageStates[state]}})
-	return d
+	return d, nil
+}
+
+// messageText is a short message's text, empty when its coding is one the
+// codec does not know.
+func messageText(m *pdu.ShortMessage) string {
+	if m.Encoding() == nil {
+		return ""
+	}
+	t, err := m.GetMessage()
+	if err != nil {
+		return ""
+	}
+	return t
 }
 
 func (s *Server) reply(ss *session, p pdu.PDU) bool {
@@ -265,10 +316,10 @@ func (s *Server) record(ss *session, p pdu.PDU) {
 	if v, ok := p.(*pdu.SubmitSM); ok {
 		r.Source, r.Destination = v.SourceAddr.Address(), v.DestAddr.Address()
 		r.EsmClass, r.RegisteredDelivery = v.EsmClass, v.RegisteredDelivery
-		r.DataCoding = v.Message.Encoding().DataCoding()
-		if t, err := v.Message.GetMessage(); err == nil {
-			r.Text = t
+		if enc := v.Message.Encoding(); enc != nil {
+			r.DataCoding = enc.DataCoding()
 		}
+		r.Text = messageText(&v.Message)
 	}
 	s.mu.Lock()
 	s.records = append(s.records, r)
@@ -324,6 +375,16 @@ func (s *Server) Reset() {
 	s.mu.Unlock()
 }
 
+// receiver is a bind of systemID that can take deliver_sm.
+func (s *Server) receiver(systemID string) *session {
+	for _, ss := range s.binds(systemID) {
+		if ss.receives {
+			return ss
+		}
+	}
+	return nil
+}
+
 func (s *Server) binds(systemID string) []*session {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -336,51 +397,109 @@ func (s *Server) binds(systemID string) []*session {
 	return out
 }
 
-// MO sends a mobile-originated message to a bind of systemID, split with an
-// 8-bit UDH when it does not fit one part, and returns the status each part
-// was answered with.
+// MO sends a mobile-originated message to a receiving bind of systemID,
+// split with an 8-bit UDH when it does not fit one part, and returns the
+// status each part was answered with.
 func (s *Server) MO(ctx context.Context, systemID, source, destination, text string) ([]uint32, error) {
-	binds := s.binds(systemID)
-	if len(binds) == 0 {
-		return nil, fmt.Errorf("no bind for %q", systemID)
+	if systemID == "" {
+		return nil, errors.New("system_id is required")
 	}
-	ss := binds[0]
-	enc := data.GSM7BIT
-	if !gsm7(text) {
-		enc = data.UCS2
+	ss := s.receiver(systemID)
+	if ss == nil {
+		return nil, fmt.Errorf("no receiving bind for %q", systemID)
 	}
-	parts, err := pdu.NewLongMessageWithEncoding(text, enc)
-	if err != nil {
-		return nil, err
-	}
+	enc, parts := split(text)
+	s.mu.Lock()
+	s.nextRef++
+	ref := s.nextRef
+	s.mu.Unlock()
 	var statuses []uint32
-	for _, part := range parts {
+	for i, part := range parts {
 		d := pdu.NewDeliverSM().(*pdu.DeliverSM)
+		var err error
 		if d.SourceAddr, err = pdu.NewAddressWithTonNpiAddr(1, 1, source); err != nil {
 			return nil, err
 		}
 		if d.DestAddr, err = pdu.NewAddressWithTonNpiAddr(1, 1, destination); err != nil {
 			return nil, err
 		}
-		d.Message = *part
+		if d.Message, err = pdu.NewShortMessageWithEncoding(part, enc); err != nil {
+			return nil, err
+		}
 		if len(parts) > 1 {
 			d.EsmClass = 0x40
+			d.Message.SetUDH(pdu.UDH{pdu.NewIEConcatMessage(byte(len(parts)), byte(i+1), ref)})
 		}
-		ack := make(chan data.CommandStatusType, 1)
-		ss.mu.Lock()
-		ss.acks[d.SequenceNumber] = ack
-		ss.mu.Unlock()
-		if err := ss.write(d); err != nil {
+		st, err := ss.exchange(ctx, d)
+		if err != nil {
 			return statuses, err
 		}
-		select {
-		case st := <-ack:
-			statuses = append(statuses, uint32(st))
-		case <-ctx.Done():
-			return statuses, ctx.Err()
-		}
+		statuses = append(statuses, uint32(st))
 	}
 	return statuses, nil
+}
+
+// exchange writes d and waits for its response.
+func (ss *session) exchange(ctx context.Context, d *pdu.DeliverSM) (data.CommandStatusType, error) {
+	ack := make(chan data.CommandStatusType, 1)
+	seq := d.SequenceNumber
+	ss.mu.Lock()
+	ss.acks[seq] = ack
+	ss.mu.Unlock()
+	defer func() {
+		ss.mu.Lock()
+		delete(ss.acks, seq)
+		ss.mu.Unlock()
+	}()
+	if err := ss.write(d); err != nil {
+		return 0, err
+	}
+	select {
+	case st := <-ack:
+		return st, nil
+	case <-ss.done:
+		return 0, errors.New("bind closed before the response")
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// split cuts text into SMS parts by encoded length: one part of 160 GSM-7
+// septets or 70 UCS-2 units, else parts of 153 or 67, never splitting a
+// GSM-7 escape pair.
+func split(text string) (data.Encoding, []string) {
+	enc, single, multi := data.Encoding(data.GSM7BIT), 160, 153
+	if !gsm7(text) {
+		enc, single, multi = data.UCS2, 70, 67
+	}
+	size := func(r rune) int {
+		switch {
+		case enc == data.UCS2 && r > 0xFFFF:
+			return 2
+		case enc == data.GSM7BIT && strings.ContainsRune(gsm7Ext, r):
+			return 2
+		}
+		return 1
+	}
+	total := 0
+	for _, r := range text {
+		total += size(r)
+	}
+	if total <= single {
+		return enc, []string{text}
+	}
+	var parts []string
+	var cur []rune
+	n := 0
+	for _, r := range text {
+		if n+size(r) > multi {
+			parts = append(parts, string(cur))
+			cur, n = nil, 0
+		}
+		cur = append(cur, r)
+		n += size(r)
+	}
+	return enc, append(parts, string(cur))
 }
 
 // gsm7 reports whether text fits the GSM 03.38 alphabet.
@@ -392,5 +511,8 @@ func gsm7(text string) bool {
 	}
 	return true
 }
+
+// gsm7Ext are the GSM 03.38 extension characters, two septets each.
+const gsm7Ext = "^{}\\[~]|€"
 
 const gsm7Chars = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€"

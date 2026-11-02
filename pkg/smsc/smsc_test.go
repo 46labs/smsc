@@ -3,10 +3,13 @@ package smsc
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,7 +47,16 @@ func connect(t *testing.T, addr, password string) (*esme, data.CommandStatusType
 	b := pdu.NewBindTransceiver().(*pdu.BindRequest)
 	b.SystemID, b.Password = "pee", password
 	e.send(b)
-	return e, e.next().GetHeader().CommandStatus
+	// Read the response raw: a refused bind is a header alone, which gosmpp's
+	// decoder does not accept for a transceiver.
+	require.NoError(t, c.SetReadDeadline(time.Now().Add(5*time.Second)))
+	var h [16]byte
+	_, err = io.ReadFull(c, h[:])
+	require.NoError(t, err)
+	n := binary.BigEndian.Uint32(h[0:4])
+	_, err = io.ReadFull(c, make([]byte, n-16))
+	require.NoError(t, err)
+	return e, data.CommandStatusType(binary.BigEndian.Uint32(h[8:12]))
 }
 
 func (e *esme) send(p pdu.PDU) {
@@ -167,5 +179,34 @@ func TestDrop(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	require.NoError(t, e.conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	_, err := pdu.Parse(e.conn)
+	assert.Error(t, err)
+}
+
+func TestSplit(t *testing.T) {
+	tests := []struct {
+		name  string
+		text  string
+		parts int
+		enc   data.Encoding
+	}{
+		{"gsm7 single", strings.Repeat("a", 160), 1, data.GSM7BIT},
+		{"gsm7 two", strings.Repeat("a", 161), 2, data.GSM7BIT},
+		{"escapes count twice", strings.Repeat("|", 81), 2, data.GSM7BIT},
+		{"ucs2 single", strings.Repeat("é€你", 23), 1, data.UCS2},
+		{"ucs2 two", strings.Repeat("你", 71), 2, data.UCS2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			enc, parts := split(tc.text)
+			assert.Equal(t, tc.enc, enc)
+			assert.Len(t, parts, tc.parts)
+			assert.Equal(t, tc.text, strings.Join(parts, ""))
+		})
+	}
+}
+
+func TestMORequiresSystemID(t *testing.T) {
+	srv, _, _ := start(t)
+	_, err := srv.MO(context.Background(), "", "1", "2", "hi")
 	assert.Error(t, err)
 }
