@@ -1,0 +1,23 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+smsc-mock
+
+# Test artifacts
+*.test
+*.out
+coverage.txt
+
+# Dev files
+.env
+.DS_Store
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
