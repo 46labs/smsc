@@ -226,10 +226,7 @@ func (s *Server) submit(ss *session, v *pdu.SubmitSM) {
 		case <-s.ctx.Done():
 			return
 		}
-		to := ss
-		if !ss.receives {
-			to = s.receiver(ss.systemID)
-		}
+		to := s.receiver(ss.systemID)
 		if to == nil {
 			slog.Debug("receipt: no receiving bind", "system_id", ss.systemID, "message_id", resp.MessageID)
 			return
@@ -377,7 +374,7 @@ func (s *Server) Reset() {
 
 // receiver is a bind of systemID that can take deliver_sm.
 func (s *Server) receiver(systemID string) *session {
-	for _, ss := range s.binds(systemID) {
+	for _, ss := range s.binds(systemID) { // live binds only
 		if ss.receives {
 			return ss
 		}
@@ -513,6 +510,6 @@ func gsm7(text string) bool {
 }
 
 // gsm7Ext are the GSM 03.38 extension characters, two septets each.
-const gsm7Ext = "^{}\\[~]|€"
+const gsm7Ext = "^{}\\[~]|€\f"
 
-const gsm7Chars = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€"
+const gsm7Chars = "@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !\"#¤%&'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà^{}\\[~]|€\f"
