@@ -16,6 +16,9 @@ import (
 //	POST /mock/submit-errors       {statuses: [88]} for the next submits
 //	PUT  /mock/receipts            {state, delay_ms, none}
 //	POST /mock/drop                {system_id}
+//	PUT  /mock/responses           {hold: true} leaves submits unanswered
+//	POST /mock/responses/release   answers them and stops holding
+//	GET  /mock/responses           {held: N}
 //	POST /mock/reset
 func (s *Server) Control() http.Handler {
 	mux := http.NewServeMux()
@@ -80,6 +83,26 @@ func (s *Server) Control() http.Handler {
 			return
 		}
 		reply(w, http.StatusOK, map[string]int{"dropped": s.Drop(in.SystemID)})
+	})
+	mux.HandleFunc("PUT /mock/responses", func(w http.ResponseWriter, r *http.Request) {
+		var in struct {
+			Hold bool `json:"hold"`
+		}
+		if !decode(w, r, &in) {
+			return
+		}
+		if in.Hold {
+			s.Hold()
+		} else {
+			s.Release()
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("POST /mock/responses/release", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, http.StatusOK, map[string]int{"released": s.Release()})
+	})
+	mux.HandleFunc("GET /mock/responses", func(w http.ResponseWriter, _ *http.Request) {
+		reply(w, http.StatusOK, map[string]int{"held": s.Held()})
 	})
 	mux.HandleFunc("POST /mock/reset", func(w http.ResponseWriter, _ *http.Request) {
 		s.Reset()
