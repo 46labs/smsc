@@ -40,7 +40,10 @@ docker run -p 2775:2775 -p 8080:8080 -e SMSC_ACCOUNTS=pee:secret ghcr.io/46labs/
 | `POST /mock/submit-errors` `{statuses: [88]}` | answers the next submits with these statuses |
 | `PUT /mock/receipts` `{state, delay_ms, none}` | receipt state (`DELIVRD`, `UNDELIV`, `EXPIRED`, `REJECTD`, ...) and delay, or none |
 | `POST /mock/drop` `{system_id}` | closes the binds |
-| `POST /mock/reset` | clears records, queued errors and receipt settings |
+| `PUT /mock/responses` `{hold: true}` | leaves submits unanswered until released |
+| `POST /mock/responses/release` | sends the held responses and stops holding |
+| `GET /mock/responses` | `{held: N}`, the responses waiting |
+| `POST /mock/reset` | clears records, queued errors, receipt settings and held responses |
 
 ## Test
 

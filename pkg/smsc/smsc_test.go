@@ -210,3 +210,25 @@ func TestMORequiresSystemID(t *testing.T) {
 	_, err := srv.MO(context.Background(), "", "1", "2", "hi")
 	assert.Error(t, err)
 }
+
+func TestHoldResponses(t *testing.T) {
+	srv, addr, ctl := start(t)
+	srv.SetReceipts(Receipts{None: true})
+	e, _ := connect(t, addr, "secret")
+
+	resp := post(t, http.MethodPut, ctl.URL+"/mock/responses", map[string]bool{"hold": true})
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	e.send(submit(t, "15550002222", 0))
+	require.Eventually(t, func() bool { return srv.Held() == 1 }, 5*time.Second, 10*time.Millisecond)
+	require.NoError(t, e.conn.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+	_, err := pdu.Parse(e.conn)
+	require.Error(t, err, "nothing answered while held")
+
+	resp = post(t, http.MethodPost, ctl.URL+"/mock/responses/release", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, data.ESME_ROK, e.next().(*pdu.SubmitSMResp).CommandStatus)
+	assert.Zero(t, srv.Held())
+
+	e.send(submit(t, "15550002222", 0))
+	assert.Equal(t, data.ESME_ROK, e.next().GetHeader().CommandStatus, "answered at once after the release")
+}

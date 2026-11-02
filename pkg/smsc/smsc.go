@@ -52,9 +52,13 @@ type Server struct {
 	records  []Record
 	errors   []data.CommandStatusType
 	receipts Receipts
-	nextID   uint64
-	nextRef  byte
-	ctx      context.Context
+	// hold keeps submit responses unsent; held are the ones waiting, each
+	// sent by its func.
+	hold    bool
+	held    []func()
+	nextID  uint64
+	nextRef byte
+	ctx     context.Context
 }
 
 // New returns a mock that accepts the given accounts.
@@ -209,7 +213,18 @@ func (s *Server) submit(ss *session, v *pdu.SubmitSM) {
 		resp.MessageID = fmt.Sprintf("%010x", s.nextID)
 	}
 	receipts := s.receipts
+	if s.hold {
+		s.held = append(s.held, func() { s.answer(ss, v, resp, receipts) })
+		s.mu.Unlock()
+		return
+	}
 	s.mu.Unlock()
+	s.answer(ss, v, resp, receipts)
+}
+
+// answer sends a submit's response and, when one is asked for, its receipt.
+// A response for a bind that has gone is lost, as on a real SMSC.
+func (s *Server) answer(ss *session, v *pdu.SubmitSM, resp *pdu.SubmitSMResp, receipts Receipts) {
 	if !s.reply(ss, resp) || resp.CommandStatus != data.ESME_ROK {
 		return
 	}
@@ -351,6 +366,34 @@ func (s *Server) SetReceipts(r Receipts) {
 	s.mu.Unlock()
 }
 
+// Hold stops sending submit responses until Release: the submits are taken
+// and recorded, and left unanswered.
+func (s *Server) Hold() {
+	s.mu.Lock()
+	s.hold = true
+	s.mu.Unlock()
+}
+
+// Release sends the held responses, in the order their submits came, and
+// answers later submits at once. It returns how many it sent.
+func (s *Server) Release() int {
+	s.mu.Lock()
+	held := s.held
+	s.hold, s.held = false, nil
+	s.mu.Unlock()
+	for _, send := range held {
+		send()
+	}
+	return len(held)
+}
+
+// Held is how many submit responses are waiting.
+func (s *Server) Held() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.held)
+}
+
 // Drop closes every bind of systemID, or every bind when it is empty, and
 // returns how many it closed.
 func (s *Server) Drop(systemID string) int {
@@ -369,6 +412,7 @@ func (s *Server) Reset() {
 	s.mu.Lock()
 	s.records, s.errors = nil, nil
 	s.receipts = Receipts{State: "DELIVRD", Delay: 100 * time.Millisecond}
+	s.hold, s.held = false, nil
 	s.mu.Unlock()
 }
 
