@@ -40,11 +40,16 @@ func start(t *testing.T) (*Server, string, *httptest.Server) {
 
 func connect(t *testing.T, addr, password string) (*esme, data.CommandStatusType) {
 	t.Helper()
+	return connectAs(t, addr, password, pdu.NewBindTransceiver().(*pdu.BindRequest))
+}
+
+// connectAs binds with b, its credentials set here.
+func connectAs(t *testing.T, addr, password string, b *pdu.BindRequest) (*esme, data.CommandStatusType) {
+	t.Helper()
 	c, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
 	t.Cleanup(func() { assert.NoError(t, c.Close()) })
 	e := &esme{t: t, conn: c}
-	b := pdu.NewBindTransceiver().(*pdu.BindRequest)
 	b.SystemID, b.Password = "pee", password
 	e.send(b)
 	// Read the response raw: a refused bind is a header alone, which gosmpp's
@@ -231,4 +236,26 @@ func TestHoldResponses(t *testing.T) {
 
 	e.send(submit(t, "15550002222", 0))
 	assert.Equal(t, data.ESME_ROK, e.next().GetHeader().CommandStatus, "answered at once after the release")
+}
+
+// A receipt with no bind to take it waits for the next bind, as an SMSC
+// stores it.
+func TestReceiptWaitsForTheNextBind(t *testing.T) {
+	srv, addr, _ := start(t)
+	// A transmitter bind takes no receipts, so none has a bind to go to.
+	e, _ := connectAs(t, addr, "secret", pdu.NewBindTransmitter().(*pdu.BindRequest))
+	e.send(submit(t, "15550002222", 1))
+	id := e.next().(*pdu.SubmitSMResp).MessageID
+
+	// The receipt waits, then goes to the next receiving bind.
+	require.Eventually(t, func() bool {
+		srv.mu.Lock()
+		defer srv.mu.Unlock()
+		return len(srv.pending["pee"]) == 1
+	}, 5*time.Second, 10*time.Millisecond)
+	again, _ := connect(t, addr, "secret")
+	d := again.next().(*pdu.DeliverSM)
+	text, err := d.Message.GetMessage()
+	require.NoError(t, err)
+	assert.Contains(t, text, "id:"+id)
 }

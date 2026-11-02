@@ -27,7 +27,8 @@ docker run -p 2775:2775 -p 8080:8080 -e SMSC_ACCOUNTS=pee:secret ghcr.io/46labs/
 - `submit_sm` is answered with a message id, or with the next queued error.
 - A submit with `registered_delivery` set gets a receipt after the configured
   delay: Appendix B text plus the `receipted_message_id` and `message_state`
-  TLVs. Failure-only requests (2) get no `DELIVRD` receipt.
+  TLVs. Failure-only requests (2) get no `DELIVRD` receipt. A receipt with
+  no receiving bind to take it waits for the account's next bind.
 - MO longer than one part is split with an 8-bit UDH and `esm_class` 0x40.
 
 ## Control API
@@ -43,7 +44,7 @@ docker run -p 2775:2775 -p 8080:8080 -e SMSC_ACCOUNTS=pee:secret ghcr.io/46labs/
 | `PUT /mock/responses` `{hold: true}` | leaves submits unanswered until released |
 | `POST /mock/responses/release` | sends the held responses and stops holding |
 | `GET /mock/responses` | `{held: N}`, the responses waiting |
-| `POST /mock/reset` | clears records, queued errors, receipt settings and held responses |
+| `POST /mock/reset` | clears records, queued errors, receipt settings, held responses and waiting receipts |
 
 ## Test
 
