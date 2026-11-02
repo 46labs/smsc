@@ -54,8 +54,11 @@ type Server struct {
 	receipts Receipts
 	// hold keeps submit responses unsent; held are the ones waiting, each
 	// sent by its func.
-	hold    bool
-	held    []func()
+	hold bool
+	held []func()
+	// pending are receipts with no receiving bind to take them, by
+	// system_id, kept for its next bind as an SMSC stores them.
+	pending map[string][]*pdu.DeliverSM
 	nextID  uint64
 	nextRef byte
 	ctx     context.Context
@@ -67,6 +70,7 @@ func New(ctx context.Context, accounts map[string]string) *Server {
 		accounts: accounts,
 		sessions: map[*session]struct{}{},
 		receipts: Receipts{State: "DELIVRD", Delay: 100 * time.Millisecond},
+		pending:  map[string][]*pdu.DeliverSM{},
 		ctx:      ctx,
 	}
 }
@@ -95,10 +99,15 @@ type session struct {
 }
 
 func (ss *session) write(p pdu.PDU) error {
-	buf := pdu.NewBuffer(make([]byte, 0, 64))
-	p.Marshal(buf)
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
+	return ss.writeLocked(p)
+}
+
+// writeLocked writes p; the caller holds mu.
+func (ss *session) writeLocked(p pdu.PDU) error {
+	buf := pdu.NewBuffer(make([]byte, 0, 64))
+	p.Marshal(buf)
 	if err := ss.conn.SetWriteDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		return err
 	}
@@ -183,10 +192,25 @@ func (s *Server) bind(ss *session, b *pdu.BindRequest) bool {
 	resp.SystemID = "smsc-mock"
 	ss.systemID = b.SystemID
 	ss.receives = b.BindingType != pdu.Transmitter
+	// The bind is registered, and so visible, with its write lock held until
+	// the response is out: anything sent to it waits behind the response.
+	ss.mu.Lock()
 	s.mu.Lock()
 	s.sessions[ss] = struct{}{}
 	s.mu.Unlock()
-	return s.reply(ss, resp)
+	err := ss.writeLocked(resp)
+	ss.mu.Unlock()
+	if err != nil {
+		slog.Debug("bind response", "system_id", ss.systemID, "error", err)
+		s.mu.Lock()
+		delete(s.sessions, ss)
+		s.mu.Unlock()
+		return false
+	}
+	if ss.receives {
+		go s.flush(ss.systemID)
+	}
+	return true
 }
 
 // writeHeader writes a PDU that is only a header.
@@ -241,19 +265,53 @@ func (s *Server) answer(ss *session, v *pdu.SubmitSM, resp *pdu.SubmitSMResp, re
 		case <-s.ctx.Done():
 			return
 		}
-		to := s.receiver(ss.systemID)
-		if to == nil {
-			slog.Debug("receipt: no receiving bind", "system_id", ss.systemID, "message_id", resp.MessageID)
-			return
-		}
 		r, err := receipt(v, resp.MessageID, receipts.State, text, time.Now())
-		if err == nil {
-			err = to.write(r)
-		}
 		if err != nil {
 			slog.Debug("receipt", "message_id", resp.MessageID, "error", err)
+			return
 		}
+		s.deliver(ss.systemID, r)
 	}()
+}
+
+// deliver sends a receipt to a receiving bind of systemID, or keeps it for
+// the next one.
+func (s *Server) deliver(systemID string, r *pdu.DeliverSM) {
+	failed := map[*session]bool{}
+	for {
+		// Queued only under the lock a bind registers under, and only when no
+		// receiving bind it has not failed to write to is registered: a bind
+		// that registers later flushes it.
+		s.mu.Lock()
+		var to *session
+		for ss := range s.sessions {
+			if ss.systemID == systemID && ss.receives && !failed[ss] {
+				to = ss
+				break
+			}
+		}
+		if to == nil {
+			s.pending[systemID] = append(s.pending[systemID], r)
+			s.mu.Unlock()
+			return
+		}
+		s.mu.Unlock()
+		if to.write(r) == nil {
+			return
+		}
+		failed[to] = true
+	}
+}
+
+// flush sends a new receiving bind the receipts kept for its system_id.
+func (s *Server) flush(systemID string) {
+	s.mu.Lock()
+	queued := s.pending[systemID]
+	delete(s.pending, systemID)
+	s.mu.Unlock()
+	for _, r := range queued {
+		s.deliver(systemID, r)
+	}
 }
 
 // messageStates maps Appendix B stats to the message_state TLV value.
@@ -413,13 +471,16 @@ func (s *Server) Reset() {
 	s.records, s.errors = nil, nil
 	s.receipts = Receipts{State: "DELIVRD", Delay: 100 * time.Millisecond}
 	s.hold, s.held = false, nil
+	s.pending = map[string][]*pdu.DeliverSM{}
 	s.mu.Unlock()
 }
 
 // receiver is a bind of systemID that can take deliver_sm.
 func (s *Server) receiver(systemID string) *session {
-	for _, ss := range s.binds(systemID) { // live binds only
-		if ss.receives {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for ss := range s.sessions { // live binds only
+		if ss.systemID == systemID && ss.receives {
 			return ss
 		}
 	}
